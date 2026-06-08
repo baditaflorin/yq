@@ -417,6 +417,7 @@ auth shapes documented above.
 | jsbundle     | `github.com/baditaflorin/go-common/jsbundle`      | source-map recovery for scanning JS bundles             |
 | apikey       | `github.com/baditaflorin/go-common/apikey`        | keystore client (`Verify`, `Cache`, admin endpoints)    |
 | middleware   | `github.com/baditaflorin/go-common/middleware`    | `TokenAuthKeystore` HTTP middleware (≥ v0.7.0)          |
+| loadshed     | `github.com/baditaflorin/go-common/loadshed`      | non-blocking concurrency gate: cap calls to a slow upstream, fast-503 the excess (`loadshed_shed_total`) (≥ v0.65.0) |
 
 ```go
 import (
@@ -483,6 +484,33 @@ patches live in `services-registry/overrides.json`. Two shapes coexist:
   "node-search-bing": { "vhost": { "proxy_buffering": "off" } }
 }
 ```
+
+**Per-slug container resource caps** (`cpus`, `mem_limit`, `pids_limit`).
+The fleet-wide backstop lives in `host-conventions.yaml`
+(`container_defaults`, default `cpus: 2.0` / `mem_limit: "1g"` /
+`pids_limit: 512`). Heavy/browser services raise them per-slug in
+`overrides.json`, which **wins over** `mesh_defaults` and
+`container_defaults` (precedence rule #4):
+
+```json
+{
+  "infrastructure-fetch-cache": { "cpus": 4.0, "mem_limit": "3g" },
+  "html-proxy":                 { "cpus": 8,   "mem_limit": "6g" }
+}
+```
+
+`cpus` is a number (e.g. `4` or `4.0`); `mem_limit` is a docker size
+string (e.g. `"3g"`). These are honored by `fleet-runner render-compose`
+(and `deploy --render-compose`) **only with fleet-runner ≥ the version
+from go_fleet_runner PR #82** — earlier binaries silently rendered the
+`host-conventions.yaml` default. A service that hand-maintains its own
+caps in its base `docker-compose.yml` opts OUT of overlay injection with
+`"compose_self_managed": true`.
+
+> **Operational gotcha:** a live `docker update --cpus N` on a running
+> container **reverts** to the rendered value on the next
+> `render-compose` / `deploy` unless the per-slug `cpus` override is set
+> in `overrides.json`. Declare the cap there to make it durable.
 
 **Bulk rules** (new, via reserved `$rules` key):
 ```json
@@ -642,7 +670,9 @@ fleet-runner health [--insecure]             # /health on all live container ser
 fleet-runner smoke  [--insecure]             # GET example_url on all container services
 fleet-runner pages-audit                     # verify pages_url 200s for every kind=static entry
 fleet-runner build-test                      # go test ./... in every kind=container,language=go workspace
-fleet-runner update-dep <mod@ver>            # bump dep across all language=go repos
+fleet-runner update-dep <mod@ver>            # bump dep across all language=go repos (or a subset: --repos a,b / --filter mesh=…,category=…,ids=a;b)
+fleet-runner rollout --dep <mod@ver> [--grep REGEX] [--graph-callers-of S,…] [--depends-on S,…] [--clone] [--apply [--pr]]  # blast-radius: discover EVERY affected service (grep ∪ graph ∪ depends_on), bump + build/test, land only the green (plan-only by default)
+fleet-runner deploy-all                       # redeploy a filtered set (--repos a,b / --mesh / --framework); honors the exclude list (won't touch infra)
 fleet-runner inject <src> <dest>             # copy a file into every repo (still all kinds, on purpose)
 fleet-runner exec   "<cmd>"                  # shell command in every repo (filterable)
 fleet-runner push   "<msg>"                  # commit+push all dirty repos
@@ -674,10 +704,20 @@ fleet-runner deploy <repo> --bootstrap --force-build --skip-smoke
 compose at HEAD and render one for each in a single pass.
 
 All commands accept `--filter kind=container,language=go` (and so on)
-to narrow the set. All commands accept `--tokens-used N --model NAME`
-for LLM accounting. **`kind: static` entries are skipped by default
-on every container-shaped operation** — don't try to deploy or health-
-check a static Pages site.
+to narrow the set. The filter axes are `mesh`, `kind`, `language`,
+`category`, and `ids` (the surgical "just these repos" axis — list
+members separated by `;` since commas separate `k=v` pairs). For
+`update-dep` and `deploy-all` there's also a dedicated `--repos a,b,c`
+convenience flag (accepts registry ids OR workspace dir names). So a
+two-repo dep bump no longer needs hand-edits:
+`fleet-runner update-dep --push --repos go_foo,go_bar <mod@ver>`.
+`update-dep` keeps Kind=container + Language=go defaults, so a targeted
+bump never reaches a static/non-Go repo, and the exclude list always
+wins over an explicitly-named repo (you cannot `--repos` your way into
+redeploying the keystore). All commands accept `--tokens-used N
+--model NAME` for LLM accounting. **`kind: static` entries are skipped
+by default on every container-shaped operation** — don't try to deploy
+or health-check a static Pages site.
 
 ## Infrastructure topology
 
@@ -954,8 +994,9 @@ your service's port if the squatter has a legitimate registered claim.
 ### Recipe — Bumping a service version (atomically across all files)
 
 **Canonical:** `fleet-runner bump-version` updates `service.yaml`, any
-`const Version = "..."` in `main.go`/`version.go`, creates the git
-tag, and (with `--push`) pushes commit + tag together:
+`const Version = "..."` in `main.go`/`version.go`, prepends a
+`CHANGELOG.md` entry (see "Per-repo CHANGELOG.md" above), creates the
+git tag, and (with `--push`) pushes commit + tag together:
 
 ```bash
 # Local bump (writes files, prints next steps for review)
@@ -963,6 +1004,12 @@ ssh root@0docker.com 'pct exec 108 -- /usr/local/bin/fleet-runner bump-version g
 
 # Atomic bump + commit + tag + push (one-shot)
 ssh root@0docker.com 'pct exec 108 -- /usr/local/bin/fleet-runner bump-version go_<repo> patch --push'
+
+# Write a richer changelog entry instead of the auto-derived commit list:
+ssh root@0docker.com 'pct exec 108 -- /usr/local/bin/fleet-runner bump-version go_<repo> minor --changelog "### Added
+- new /foo endpoint
+### Fixed
+- BREAKING: renamed ?q= to ?url=" --push'
 
 # Variants:  minor  /  major  /  --set 2.0.0
 ```
@@ -1112,6 +1159,48 @@ fleet-runner audit --all    --services /root/workspace/services-registry/service
 fleet-runner state snapshot --services /root/workspace/services-registry/services.json
 ```
 
+### Recipe — Rolling out a blast-radius change (shared lib / shared dep)
+
+**When a change to a shared thing affects N services** — a `go-common`
+bump, a changed client signature, a new env contract — don't hand-grep
+and hope. `fleet-runner rollout` finds EVERY affected service, propagates
+the change, and proves each still builds.
+
+```bash
+# 1. PLAN (read-only, the default): see the complete affected set.
+#    Run on Builder LXC 108 so the code-grep sees the full workspace.
+fleet-runner rollout \
+  --dep github.com/baditaflorin/go-common@<LATEST> \
+  --grep 'client\.JSProxy(DOM)?\(|GetRendered\(|FetchNetwork\(|RenderJS' \
+  --graph-callers-of go-js-proxy,go-js-proxy-network,infrastructure-fetch-cache
+
+# 2. APPLY: bump + build/test each consumer, land one auto-merge PR per repo,
+#    emit a fleet-state/sweeps manifest (revertable via sweep-rollback).
+fleet-runner rollout --dep …@<LATEST> --grep '…' --clone --apply --pr
+```
+
+Discovery is the **union** of three sources, because each has blind spots:
+`--grep` (code signature — catches cold consumers the runtime graph never
+saw), `--graph-callers-of` (go-fleet-graph inbound callers), `--depends-on`
+(services.json declared edges). The union is intersected with
+`kind=container,language=go` + excludes, and the backend slugs themselves
+are dropped.
+
+Three non-obvious rules:
+
+- **The runtime graph is blind to intra-mesh calls.** Sibling-service calls
+  (fetch-cache, js-proxy) use a plain `net/http.Client`, not `safehttp`, so
+  go-fleet-graph never records the edge. `fleet-runner deps <slug>` will show
+  ZERO callers for an intra-mesh backend even when 48 services depend on it.
+  For intra-mesh deps the **code-grep is authoritative** — that's why rollout
+  unions grep with the graph instead of trusting the graph alone.
+- **`--clone` first** (or run on LXC 108 where the workspace is kept
+  complete): the grep is only as complete as the local checkouts, and the
+  registry has ~110 repos that may not be cloned on a given host. rollout
+  reports a "code-grep is PARTIAL" warning when repos are missing.
+- **Always pass the actual LATEST dep version**, never a stale literal —
+  `go get dep@vOld` on a repo already ahead silently *downgrades* it.
+
 ### Recipe — Closing a capability gap (gap → fix loop)
 
 **When you notice during a real engagement that a fleet service is
@@ -1255,6 +1344,67 @@ for the canonical pattern.
    *must* bind a port, use `127.0.0.1:0` (ephemeral) and `kill` it on
    the same line that started it.
 
+## Deploy failure class — a saturated slow upstream sheds load and rolls back deploys (2026-06-08)
+
+**Symptom.** `fleet-runner deploy <enricher>` (or any container deploy)
+rolls back at the smoke gate because the new image's `GET /selftest`
+times out — even though `/health` is green and the code is fine. The
+real cause is somewhere else entirely: a *different* service is piling
+goroutines on a slow shared upstream and starving the whole dockerhost's
+scheduler, so every service's `/selftest` probe stalls past its 8 s
+deadline. One service's overload silently fails everyone's deploys.
+
+The canonical instance: `go_infrastructure_fetch_cache` (port 18205)
+proxies render requests to `go-js-proxy` / `go-html-proxy`, each held up
+to 95 s. A backfill fan-out fires thousands of concurrent `render=*`
+requests; ~8.3k goroutines pile on the saturated renderer (host loadavg
+56/20 cores); the scheduler thrashes; downstream enrichers' `/selftest`
+probes time out; healthy deploys fleet-wide roll back. Any service that
+proxies to a saturatable sibling (a renderer, a headless browser, a
+rate-limited upstream) can produce the same blast radius.
+
+**Diagnosis.** Confirm it's goroutine pile-up, not the deploying service:
+
+```bash
+# Goroutine count on the suspected proxy (fetch-cache here): a healthy
+# box sits in the low hundreds; a pile-up reads thousands.
+curl -s http://<dockerhost>:18205/metrics | grep '^go_goroutines'
+
+# The human-readable stats page surfaces the shed + upstream-error
+# counters: a climbing render_shed means the gate is actively shedding
+# (good — it's protecting the box); a high upstream_errors means the
+# renderer itself is failing/slow (the root cause).
+curl -s http://<dockerhost>:18205/ | grep -E 'render_shed|upstream_errors'
+```
+
+For the fleet-standard signal, `loadshed_shed_total{service,gate}` is
+emitted on `/metrics` by every service using `go-common/loadshed` — a
+sustained nonzero rate is the "this box is shedding load" alert.
+
+**Live mitigation (no rebuild).** The render cap is env-tunable. Lower
+`MAX_RENDER_INFLIGHT` on the host to shed sooner and shrink the pile-up,
+then bounce the container — no image rebuild, no `fleet-runner deploy`:
+
+```bash
+# On the dockerhost, in the service's compose dir:
+cd /opt/services/go_infrastructure_fetch_cache
+sed -i 's/^MAX_RENDER_INFLIGHT=.*/MAX_RENDER_INFLIGHT=24/' .env   # or add it
+sudo docker compose up -d   # picks up the new env; no pull/rebuild
+```
+
+Once the pile-up drains, the stalled `/selftest` probes pass and deploys
+stop rolling back. Re-run the blocked deploy. Set the cap back up (or
+remove it for the default 64) when the upstream recovers. The durable
+fix for the root-cause backfill is to rate-limit the fan-out producer,
+not just shed at the cache.
+
+**Building a new proxy-to-slow-upstream service?** Don't hand-roll the
+shed semaphore — use `go-common/loadshed` (`loadshed.New(name, limit)` +
+`TryAcquire`/`WriteShed`, or `gate.Guard` middleware). It gives you the
+fast-503 + `Retry-After` path and the `loadshed_shed_total` metric for
+free. See `go_infrastructure_fetch_cache`'s `renderGate` for the
+canonical in-line (gate only the expensive sub-path) usage.
+
 ## SQLite safety — mandatory three rules (enforced 2026-05-26)
 
 `modernc.org/sqlite` uses real `fcntl` syscalls for WAL file locking.
@@ -1315,8 +1465,54 @@ done
 
 The cardinal rule when you'd otherwise touch every service: **modify
 the library and bump the dep.** A `go-common` patch plus
-`fleet-runner update-dep github.com/baditaflorin/go-common@vX.Y.Z`
-beats 130 PRs.
+`fleet-runner update-dep --push github.com/baditaflorin/go-common@vX.Y.Z`
+beats 130 PRs. To bump only a subset (stragglers, one mesh, one
+category) add `--repos a,b` or `--filter mesh=…,category=…,ids=a;b` —
+`update-dep` is no longer fleet-wide-only.
+
+**`go-common` ≥ v0.55.0 — `/selftest` bypasses the fetch cache.** The
+`selftest.Suite` now runs every check with
+`safehttp.WithoutFetchCacheContext(ctx)`, so `/selftest` validates the
+service's REAL outbound path (DNS + TLS + origin) instead of routing
+live probes through a cold fleet cache. Before this, live-probe
+selftests (e.g. a detector fetching vercel/netlify/fly) routed through
+the cold cache on the freshly-built image and blew past
+`fleet-runner deploy`'s 8 s smoke `/selftest` timeout — false-failing
+otherwise-healthy deploys and rolling them back. If you see a deploy
+roll back on a `/selftest` timeout while `/health` is green, the fix is
+to bump the service to go-common ≥ v0.55.0 and redeploy; do NOT reach
+for `--skip-smoke`. Need a single client to skip the cache outside
+selftest? `safehttp.WithoutFetchCache()` (per-client) or
+`WithoutFetchCacheContext(ctx)` (per-request).
+
+## Per-repo `CHANGELOG.md` — capture what changed at each version
+
+Every container repo keeps a **`CHANGELOG.md`** at its root, newest
+entry on top, in the same shape `go-common` uses:
+
+```markdown
+## <version> — <YYYY-MM-DD>
+
+### Added | Changed | Fixed | Removed
+- one bullet per meaningful change; lead breaking changes with **BREAKING:**
+```
+
+Why: with ~220 services moving independently, "what shipped in this
+version and could it have broken X?" is otherwise un-answerable without
+trawling git. A per-version, human-and-AI-written entry makes
+regressions diff-able at a glance and feeds the fleet-wide
+`fleet-runner changelog` digest with intent (not just PR titles).
+
+**You (the agent) write the entry — you just made the change, so you
+know what happened and why.** `fleet-runner bump-version` scaffolds it
+for you: it prepends a `## <newver> — <date>` block to `CHANGELOG.md`
+(creating the file if absent), auto-populating it with the commit
+subjects since the previous tag. Pass `--changelog "### Added\n- …"`
+to write a richer entry instead of the auto-derived one. The changelog
+edit rides the same atomic bump commit as `service.yaml` + the tag, so
+a version never lands without a changelog line. This is opt-out only by
+omission — don't bump a service's version without leaving a changelog
+entry.
 
 ## Local workflow
 
